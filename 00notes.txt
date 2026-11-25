@@ -1,0 +1,204 @@
+================================================================================
+LANGGRAPH & MCP (MODEL CONTEXT PROTOCOL) — COMPLETE STUDY NOTES
+================================================================================
+
+--------------------------------------------------------------------------------
+1. THE BIG PICTURE: HOW EVERYTHING CONNECTS
+--------------------------------------------------------------------------------
+Think of an AI agent system as 3 distinct layers:
+
+1) THE LLM (Gemini, Llama on Groq, GPT, Claude) = THE BRAIN
+   - Stateless prediction engine sitting idle on a server.
+   - Has NO memory on its own, cannot run code, and cannot browse the web.
+   - Only reads a list of messages and returns either text or a JSON request
+     saying "call this tool with these arguments".
+
+2) LANGGRAPH = THE BODY & INTERNAL CONTROL FLOW
+   - Manages the shared "State" (dictionary holding conversation history & data).
+   - Controls the loop: LLM Node -> Decision (tools_condition) -> Tool Node ->
+     back to LLM Node -> END.
+   - Saves snapshots ("checkpoints") via MemorySaver using thread_id so chats
+     continue seamlessly.
+
+3) MCP (MODEL CONTEXT PROTOCOL) = THE UNIVERSAL PLUG TO THE OUTSIDE WORLD
+   - Standard open protocol connecting your LangGraph agent (or IDEs like
+     Cursor and Claude Desktop) to external tools, APIs, and databases.
+   - Instead of rewriting custom @tool functions inside every script, you build
+     or connect to standalone MCP Servers once, and any MCP Client can load them.
+
+
+--------------------------------------------------------------------------------
+2. LANGGRAPH VS. MCP — QUICK COMPARISON
+--------------------------------------------------------------------------------
++------------------------+-----------------------------------------------------+
+| Feature                | Responsibility                                      |
++------------------------+-----------------------------------------------------+
+| LangGraph              | Internal workflow logic, State dictionary, routing  |
+|                        | loops, checkpoints (MemorySaver), human approval.   |
++------------------------+-----------------------------------------------------+
+| Custom @tool (Python)  | Quick, single-script Python functions locked to     |
+|                        | that specific project.                              |
++------------------------+-----------------------------------------------------+
+| MCP (Model Context     | Reusable, plug-and-play tool servers that any app   |
+| Protocol)              | (LangGraph, Cursor, Claude) can connect to via      |
+|                        | an MCP Client without rewriting tool code.          |
++------------------------+-----------------------------------------------------+
+
+
+--------------------------------------------------------------------------------
+3. MCP ARCHITECTURE: SERVER, CLIENT, HOST APP & TRANSPORT
+--------------------------------------------------------------------------------
++----------------------+       MCP Protocol       +----------------------+
+|   HOST APP           |   (stdio or HTTP/URL)    |     MCP SERVER       |
+|  (LangGraph Agent /  | <======================> |  (Holds the actual   |
+|   Cursor / Claude)   |                          |   Python tools)      |
+|                      |                          |                      |
+|  +----------------+  |                          |  - add(a, b)         |
+|  |   MCP Client   |  |  1. Discovers tools      |  - multiply(a, b)    |
+|  | (1:1 per server|  |  2. Sends tool args      |  - get_weather(city) |
+|  |  via adapters) |  |  3. Receives results     |                      |
+|  +----------------+  |                          +----------------------+
++----------------------+
+
+KEY ROLES:
+- MCP Server: Standalone program holding your actual functions/API calls.
+- Host App: The application running the LLM and user session (e.g., your
+  LangGraph Python script or Cursor).
+- MCP Client: Sits inside the Host App (MultiServerMCPClient in Python).
+  Maintains a 1:1 connection with each MCP Server and converts MCP tools into
+  standard LangChain tools via `await client.get_tools()`.
+
+TWO TRANSPORT MODES (HOW CLIENT & SERVER TALK):
+1) stdio (Standard Input / Output):
+   - Used when the MCP Server runs locally on the same machine as the client.
+   - The client automatically launches the server script as a background
+     subprocess (e.g., `python mathserver.py`) and communicates via terminal
+     stdin/stdout. No port or URL needed.
+   - Note: Never use `print()` in a stdio server, as it corrupts the JSON stream.
+
+2) streamable-http (Network / URL):
+   - Used when the server runs independently on a local port or remote cloud
+     URL (e.g., `http://localhost:8000/mcp`).
+   - You must start this server first in its own terminal; multiple clients can
+     connect to it simultaneously.
+   - Watch the spelling difference:
+       * Server side: transport="streamable-http"  (hyphen)
+       * Client side: "transport": "streamable_http" (underscore)
+
+
+--------------------------------------------------------------------------------
+4. STEP-BY-STEP CODE WALKTHROUGH
+--------------------------------------------------------------------------------
+
+--- FILE 1: mathserver.py (MCP Server #1 using stdio) ---
+
+from mcp.server.fastmcp import FastMCP
+
+# 1. Initialize a FastMCP server named "Math"
+mcp = FastMCP("Math")
+
+# 2. Register functions as MCP tools using @mcp.tool()
+#    Docstrings and type hints tell the LLM what the tool does and expects.
+@mcp.tool()
+def add(a: int, b: int) -> int:
+    """Add two numbers"""
+    return a + b
+
+@mcp.tool()
+def multiply(a: int, b: int) -> int:
+    """Multiply two numbers"""
+    return a * b
+
+# 3. Run over stdio (client will launch this file automatically)
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+
+
+--- FILE 2: weatherserver.py (MCP Server #2 using streamable-http) ---
+
+from mcp.server.fastmcp import FastMCP
+
+# 1. Initialize a FastMCP server named "Weather"
+mcp = FastMCP("Weather")
+
+# 2. Register an async tool
+@mcp.tool()
+async def get_weather(location: str) -> str:
+    """Get the weather location."""
+    return "It's always raining in California"
+
+# 3. Run as an HTTP server on http://127.0.0.1:8000/mcp
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
+
+
+--- FILE 3: client.py (LangGraph Agent + MultiServerMCPClient) ---
+
+import asyncio
+from dotenv import load_dotenv
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from langchain.chat_models import init_chat_model
+
+# Load GOOGLE_API_KEY / GROQ_API_KEY from .env
+load_dotenv()
+
+async def main():
+    # 1. Configure connections to BOTH MCP servers at once
+    client = MultiServerMCPClient(
+        {
+            "math": {
+                "command": "python",
+                "args": ["mathserver.py"],   # Match your exact filename
+                "transport": "stdio",
+            },
+            "weather": {
+                "url": "http://localhost:8000/mcp",
+                "transport": "streamable_http",
+            }
+        }
+    )
+
+    # 2. Fetch tools from both servers and convert to LangChain tools
+    tools = await client.get_tools()
+
+    # 3. Initialize the LLM brain (swappable: Gemini, Groq, etc.)
+    model = init_chat_model("google_genai:gemini-3.5-flash-lite")
+
+    # 4. Build the LangGraph ReAct agent (LLM Node + ToolNode loop)
+    agent = create_react_agent(model, tools)
+
+    # 5. Invoke the agent (must use async `ainvoke` for MCP tools)
+    math_response = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "what's (3 + 5) x 12?"}]}
+    )
+    print("Math response:", math_response["messages"][-1].content)
+
+    weather_response = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "what is the weather in California?"}]}
+    )
+    print("Weather response:", weather_response["messages"][-1].content)
+
+asyncio.run(main())
+
+
+--------------------------------------------------------------------------------
+5. HOW TO RUN IN CURSOR (2 TERMINALS)
+--------------------------------------------------------------------------------
+Terminal 1 (Start the HTTP server first and leave it running):
+    .venv\Scripts\activate
+    python weatherserver.py
+
+Terminal 2 (Open a new split terminal with '+' and run the client):
+    .venv\Scripts\activate
+    python client.py
+
+Execution Flow During `client.py`:
+1. `client.get_tools()` spawns `mathserver.py` via stdio and queries
+   `http://localhost:8000/mcp` via HTTP to collect `add`, `multiply`, and
+   `get_weather`.
+2. For "(3 + 5) x 12", the LLM calls `add(3, 5)` -> gets 8 -> calls
+   `multiply(8, 12)` -> gets 96 -> writes final answer.
+3. For "weather in California", the LLM calls `get_weather("California")` ->
+   gets "It's always raining in California" -> writes final answer.
+================================================================================

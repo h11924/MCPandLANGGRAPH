@@ -1,5 +1,5 @@
 import asyncio
-import os
+import sys
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
@@ -11,8 +11,8 @@ async def main():
     client = MultiServerMCPClient(
         {
             "math": {
-                "command": "python",
-                "args": ["mathserver.py"],
+                "command": sys.executable,
+                "args": ["11mathserver.py"],
                 "transport": "stdio",
             },
             "weather": {
@@ -23,7 +23,7 @@ async def main():
     )
 
     tools = await client.get_tools()
-    model = init_chat_model("google_genai:gemini-3.5-flash-lite")
+    model = init_chat_model("google_genai:gemini-3.8-flash")
     agent = create_react_agent(model, tools)
 
     math_response = await agent.ainvoke(
@@ -36,4 +36,5 @@ async def main():
     )
     print("Weather response:", weather_response["messages"][-1].content)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
